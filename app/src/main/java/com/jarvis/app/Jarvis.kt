@@ -74,14 +74,32 @@ class MainActivity : Activity() {
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(48, 120, 48, 48)
 
+        val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+
         val info = TextView(this)
-        info.text = "Jarvis\n\n1) Start Jarvis dabao aur permissions allow karo\n" +
-            "2) Accessibility chalu karo (scroll, click, WhatsApp send ke liye)\n" +
-            "3) Battery me Unrestricted karo\n\nPhir bolo: \"V\""
+        info.text = "Jarvis\n\n1) Neeche wake word likho (jaise V ya Jarvis)\n" +
+            "2) Start Jarvis dabao aur permissions allow karo\n" +
+            "3) Accessibility chalu karo (scroll, click, WhatsApp send ke liye)\n" +
+            "4) Battery me Unrestricted karo\n\nPhir wake word bolo"
         info.textSize = 16f
         col.addView(info)
 
-        addButton(col, "Start Jarvis") { startJarvis() }
+        val wk = EditText(this)
+        wk.hint = "Wake word (jaise: V, Jarvis, Computer)"
+        wk.setText(sp.getString("wake", "V"))
+        wk.setSingleLine()
+        col.addView(wk)
+
+        addButton(col, "Start Jarvis") {
+            val w = wk.text.toString().trim()
+            sp.edit().putString("wake", if (w.isEmpty()) "v" else w).apply()
+            startJarvis()
+        }
+        addButton(col, "Debug ON/OFF (jo sunta hai wo dikhao)") {
+            val on = !sp.getBoolean("debug", false)
+            sp.edit().putBoolean("debug", on).apply()
+            Toast.makeText(this, if (on) "Debug ON" else "Debug OFF", Toast.LENGTH_SHORT).show()
+        }
         addButton(col, "Stop Jarvis (band karo)") {
             stopService(Intent(this, JarvisService::class.java))
             Toast.makeText(this, "Jarvis band ho gaya", Toast.LENGTH_SHORT).show()
@@ -127,12 +145,12 @@ class MainActivity : Activity() {
             return
         }
         startForegroundService(Intent(this, JarvisService::class.java))
-        Toast.makeText(this, "Jarvis chalu! Ab bolo: V", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "Jarvis chalu! Ab wake word bolo", Toast.LENGTH_LONG).show()
     }
 }
 
 // =====================================================================
-//  BACKGROUND SERVICE: sunta rehta hai, "V" sunte hi "Yes boss"
+//  BACKGROUND SERVICE: sunta rehta hai, wake word sunte hi "Yes boss"
 // =====================================================================
 class JarvisService : Service(), TextToSpeech.OnInitListener {
     companion object {
@@ -153,7 +171,8 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private var againRun: Runnable? = null
     private var dot: View? = null
     private var wl: PowerManager.WakeLock? = null
-    private val wakeWords = setOf("v", "vee", "vi", "bee", "वी", "वि", "बी")
+    private val vWords = setOf("v", "vee", "vi", "ve", "bee", "b", "वी", "वि", "बी")
+    private var dbg: Toast? = null
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -171,11 +190,11 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         )
         val stopAct = Notification.Action.Builder(
             Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
-            "V band karo", stopPi
+            "Band karo", stopPi
         ).build()
         val n = Notification.Builder(this, "jarvis")
-            .setContentTitle("V sun raha hai")
-            .setContentText("\"V\" bolo (ya Hey V)")
+            .setContentTitle("Jarvis sun raha hai")
+            .setContentText("Wake word bolo")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .addAction(stopAct)
@@ -230,7 +249,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         }
         val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         val g = if (h < 12) "सुप्रभात बॉस" else if (h < 17) "नमस्ते बॉस" else "शुभ संध्या बॉस"
-        say("$g, वी तैयार है") { again(100L) }
+        say("$g, मैं तैयार हूँ") { again(100L) }
     }
 
     // text me Devanagari ho to Hindi awaaz, warna Lang wali awaaz
@@ -274,11 +293,35 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         .replace('\u0958', 'क').replace('\u0959', 'ख').replace('\u095A', 'ग').replace('\u095B', 'ज')
         .replace('\u095C', 'ड').replace('\u095D', 'ढ').replace('\u095E', 'फ').replace('\u095F', 'य')
 
-    // wake word "V" ke baad ka text ("" = sirf V bola, null = V bola hi nahi)
-    // V shuru me hi hona chahiye (ya "hey V" / "ok V")
+    // app me likha hua wake word (default: v)
+    private fun wakeWord(): String {
+        val raw = getSharedPreferences("cfg", MODE_PRIVATE).getString("wake", "v") ?: "v"
+        val last = raw.lowercase().trim().split(" ").lastOrNull { it.isNotBlank() } ?: "v"
+        return last
+    }
+
+    private fun isWakeTok(tk: String): Boolean {
+        if (tk.isEmpty()) return false
+        val w = wakeWord()
+        if (w == "v") return tk in vWords
+        if (tk == w) return true
+        val key = Hi.skel(w)
+        return key.length >= 3 && Hi.skel(tk) == key
+    }
+
+    // debug ON ho to jo phone ne suna wo screen pe dikhata hai
+    private fun debug(msg: String) {
+        if (!getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("debug", false)) return
+        dbg?.cancel()
+        dbg = Toast.makeText(this, msg, Toast.LENGTH_SHORT)
+        dbg?.show()
+    }
+
+    // wake word ke baad ka text ("" = sirf wake word bola, null = bola hi nahi)
+    // wake word shuru me hi hona chahiye (ya "hey <wake word>")
     private fun afterWake(low: String): String? {
         val toks = low.split(" ").filter { it.isNotBlank() }
-        val idx = toks.indexOfFirst { tk -> tk.trim { c -> c in ",.?!।" } in wakeWords }
+        val idx = toks.indexOfFirst { tk -> isWakeTok(tk.trim { c -> c in ",.?!।" }) }
         if (idx < 0 || idx > 1) return null
         return toks.drop(idx + 1).joinToString(" ")
     }
@@ -291,7 +334,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         say("Yes boss") { listen(true, false) }
     }
 
-    // command=false: sirf "V" ka intezaar. command=true: aapka hukum sunna.
+    // command=false: sirf wake word ka intezaar. command=true: aapka hukum sunna.
     // localOnly=true: sirf phone-command maanega (shor se AI na chale)
     private fun listen(command: Boolean, localOnly: Boolean = false) {
         if (!alive) return
@@ -316,6 +359,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             override fun onPartialResults(b: Bundle?) {
                 if (my != gen || command) return
                 val t = first(b) ?: return
+                debug("सुना: $t")
                 val after = afterWake(norm(t)) ?: return
                 cancelWake()
                 if (after.length <= 2) {
@@ -328,6 +372,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             override fun onError(e: Int) {
                 if (my != gen) return
                 if (command) Commands.pending = null
+                if (!command && e != SpeechRecognizer.ERROR_NO_MATCH && e != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) debug("mic error: $e")
                 val d = when (e) {
                     SpeechRecognizer.ERROR_NO_MATCH -> 150L
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 150L
@@ -347,6 +392,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                     return
                 }
                 val low = norm(t)
+                if (!command) debug("सुना: $t")
                 if (command) { handle(low, localOnly); return }
                 val cmd = afterWake(low)
                 if (cmd == null) { again(100L); return }
@@ -368,7 +414,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private fun safeRun(s: String): String? =
         try { Commands.run(this, s) } catch (e: Exception) { "ये काम नहीं हो पाया" }
 
-    // kaam ke baad: bina "V" bole agla hukum sun lo
+    // kaam ke baad: bina wake word bole agla hukum sun lo
     private fun afterLocal() {
         if (Commands.pending != null) listen(true, false) else listen(true, true)
     }
@@ -463,7 +509,7 @@ class JarvisAccess : AccessibilityService() {
         val g = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(p, 0L, 300L))
             .build()
-        return dispatchGesture(g, null, null)
+          return dispatchGesture(g, null, null)
     }
 
     fun scroll(dir: String): String {
