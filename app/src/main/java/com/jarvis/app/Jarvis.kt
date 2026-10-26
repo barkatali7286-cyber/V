@@ -9,10 +9,12 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.drawable.Icon
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.*
 import android.provider.AlarmClock
@@ -37,16 +39,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.*
-
-// =====================================================================
-//  BHASHA (language) - Jarvis kis bhasha me sunega aur bolega
-// =====================================================================
-object Lang {
-    @Volatile
-    var code: String = "hi-IN"
-    @Volatile
-    var name: String = "Hindi"
-}
 
 // =====================================================================
 //  SCREEN: Start / Stop / Settings / Test
@@ -100,6 +92,21 @@ class MainActivity : Activity() {
             sp.edit().putBoolean("debug", on).apply()
             Toast.makeText(this, if (on) "Debug ON" else "Debug OFF", Toast.LENGTH_SHORT).show()
         }
+        addButton(col, "Engine badlo: Offline / Google") {
+            val cur = sp.getString("engine", "vosk") ?: "vosk"
+            val nw = if (cur == "vosk") "google" else "vosk"
+            sp.edit().putString("engine", nw).apply()
+            val m = if (nw == "vosk") "Offline engine: tez aur bina internet" else "Google engine: zyada sahi, internet chahiye"
+            Toast.makeText(this, m + ". Jarvis ko Stop karke dobara Start karo", Toast.LENGTH_LONG).show()
+        }
+        addButton(col, "Beech-beech bolna ON/OFF") {
+            val on = !sp.getBoolean("chatter", true)
+            sp.edit().putBoolean("chatter", on).apply()
+            Toast.makeText(this, if (on) "Jarvis beech-beech bolega" else "Jarvis chup rahega", Toast.LENGTH_SHORT).show()
+        }
+        addButton(col, "Abhi kuch bolo (test)") {
+            startService(Intent(this, JarvisService::class.java).setAction(JarvisService.ACTION_CHATTER))
+        }
         addButton(col, "Stop Jarvis (band karo)") {
             stopService(Intent(this, JarvisService::class.java))
             Toast.makeText(this, "Jarvis band ho gaya", Toast.LENGTH_SHORT).show()
@@ -150,11 +157,12 @@ class MainActivity : Activity() {
 }
 
 // =====================================================================
-//  BACKGROUND SERVICE: sunta rehta hai, wake word sunte hi "Yes boss"
+//  BACKGROUND SERVICE: sunta rehta hai, "V" sunte hi "Yes boss"
 // =====================================================================
-class JarvisService : Service(), TextToSpeech.OnInitListener {
+class JarvisService : Service(), TextToSpeech.OnInitListener, OfflineCallback {
     companion object {
         const val ACTION_STOP = "com.jarvis.app.STOP"
+        const val ACTION_CHATTER = "com.jarvis.app.CHATTER"
     }
 
     private var tts: TextToSpeech? = null
@@ -174,12 +182,34 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private val vWords = setOf("v", "vee", "vi", "ve", "bee", "b", "वी", "वि", "बी")
     private var dbg: Toast? = null
 
+    // offline (Vosk) engine ki halat
+    private var offline: Offline? = null
+    private var useVosk = false
+    private var vState = 0
+    private var vBusy = true
+    private var vLocalOnly = false
+    private var followRun: Runnable? = null
+
+    @Volatile
+    private var curUtt = ""
+    private var sayWatch: Runnable? = null
+    private var chatterRun: Runnable? = null
+    private var inCommand = false
+
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
         if (i?.action == ACTION_STOP) {
             stopSelf()
             return START_NOT_STICKY
+        }
+        if (i?.action == ACTION_CHATTER) {
+            if (!started) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            main.post { chatterNow(true) }
+            return START_STICKY
         }
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("jarvis", "Jarvis", NotificationManager.IMPORTANCE_LOW))
@@ -241,6 +271,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
                 override fun onDone(id: String?) {
+                    if (id != curUtt) return
                     main.post { val f = afterSpeech; afterSpeech = null; f?.invoke() }
                 }
                 override fun onError(id: String?) { onDone(id) }
@@ -249,7 +280,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         }
         val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         val g = if (h < 12) "सुप्रभात बॉस" else if (h < 17) "नमस्ते बॉस" else "शुभ संध्या बॉस"
-        say("$g, मैं तैयार हूँ") { again(100L) }
+        say(g) { startEngine() }
     }
 
     // text me Devanagari ho to Hindi awaaz, warna Lang wali awaaz
@@ -265,12 +296,22 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
     private fun say(t: String, then: (() -> Unit)?) {
         afterSpeech = then
+        sayWatch?.let { main.removeCallbacks(it) }
         if (!ttsReady) {
             main.post { val f = afterSpeech; afterSpeech = null; f?.invoke() }
             return
         }
         applyVoice(t)
-        tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "u" + System.nanoTime())
+        val id = "u" + System.nanoTime()
+        curUtt = id
+        tts?.setPitch(Emotion.pitch())
+        tts?.setSpeechRate(Emotion.rate())
+        tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, id)
+        val w = Runnable {
+            if (curUtt == id) { val f = afterSpeech; afterSpeech = null; f?.invoke() }
+        }
+        sayWatch = w
+        main.postDelayed(w, 25000L)
     }
 
     private fun cancelWake() {
@@ -306,7 +347,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         if (w == "v") return tk in vWords
         if (tk == w) return true
         val key = Hi.skel(w)
-        return key.length >= 3 && Hi.skel(tk) == key
+        return key.length >= 3 && Fuzz.close(Hi.skel(tk), key)
     }
 
     // debug ON ho to jo phone ne suna wo screen pe dikhata hai
@@ -322,8 +363,11 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private fun afterWake(low: String): String? {
         val toks = low.split(" ").filter { it.isNotBlank() }
         val idx = toks.indexOfFirst { tk -> isWakeTok(tk.trim { c -> c in ",.?!।" }) }
-        if (idx < 0 || idx > 1) return null
-        return toks.drop(idx + 1).joinToString(" ")
+        if (idx in 0..1) return toks.drop(idx + 1).joinToString(" ")
+        for (i in 0..1) {
+            if (i + 1 < toks.size && isWakeTok(toks[i] + toks[i + 1])) return toks.drop(i + 2).joinToString(" ")
+        }
+        return null
     }
 
     private fun wakeNow() {
@@ -334,7 +378,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         say("Yes boss") { listen(true, false) }
     }
 
-    // command=false: sirf wake word ka intezaar. command=true: aapka hukum sunna.
+    // command=false: sirf "Jarvis" ka intezaar. command=true: aapka hukum sunna.
     // localOnly=true: sirf phone-command maanega (shor se AI na chale)
     private fun listen(command: Boolean, localOnly: Boolean = false) {
         if (!alive) return
@@ -346,6 +390,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             return
         }
         val my = ++gen
+        inCommand = command
         rec?.destroy()
         rec = SpeechRecognizer.createSpeechRecognizer(this)
         rec?.setRecognitionListener(object : RecognitionListener {
@@ -412,18 +457,190 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun safeRun(s: String): String? =
-        try { Commands.run(this, s) } catch (e: Exception) { "ये काम नहीं हो पाया" }
+        try {
+            if (Commands.pending != null) Commands.run(this, s)
+            else (Emotion.respond(s) ?: Extra.run(this, s) ?: Commands.run(this, s))
+        } catch (e: Exception) {
+            "ये काम नहीं हो पाया"
+        }
+
+    // ---------------- Engine: Offline (Vosk) ya Google ----------------
+    private fun startEngine() {
+        if (!alive) return
+        if (chatterRun == null) scheduleChatter()
+        val eng = getSharedPreferences("cfg", MODE_PRIVATE).getString("engine", "vosk") ?: "vosk"
+        if (eng == "vosk") {
+            useVosk = true
+            say("ऑफलाइन इंजन तैयार हो रहा है, थोड़ा रुकिए बॉस", null)
+            val o = Offline(this, this)
+            offline = o
+            o.start()
+        } else {
+            useVosk = false
+            again(100L)
+        }
+    }
+
+    override fun onReady() {
+        if (!alive) return
+        vBusy = true
+        offline?.pause()
+        say("मैं तैयार हूँ बॉस") {
+            vState = 0
+            vResume()
+        }
+    }
+
+    override fun onFail(msg: String) {
+        if (!alive) return
+        Toast.makeText(this, "Offline engine error: $msg", Toast.LENGTH_LONG).show()
+        if (useVosk) {
+            useVosk = false
+            try { offline?.stop() } catch (e: Exception) {}
+            offline = null
+            say("ऑफलाइन इंजन नहीं चला, गूगल इंजन चालू कर रहा हूँ") { again(100L) }
+        }
+    }
+
+override fun onPartial(text: String) {
+        if (!useVosk || vBusy || vState != 0 || text.isBlank()) return
+        debug("सुना: $text")
+        val after = afterWake(norm(text)) ?: return
+        cancelWake()
+        if (after.length <= 2) {
+            val r = Runnable { if (!vBusy && vState == 0) wakeNowV() }
+            wakeRun = r
+            main.postDelayed(r, 250L)
+        }
+    }
+
+    override fun onFinal(text: String) {
+        if (!useVosk || vBusy || text.isBlank()) return
+        debug("सुना: $text")
+        val low = norm(text)
+        cancelWake()
+        val after = afterWake(low)
+        if (vState == 0) {
+            if (after == null) return
+            if (after.length > 2) vStart(after, false) else wakeNowV()
+        } else {
+            if (after != null && after.length <= 2) return
+            vStart(after ?: low, vLocalOnly)
+        }
+    }
+
+    private fun beep() {
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
+            main.postDelayed({ tg.release() }, 500L)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun wakeNowV() {
+        cancelWake()
+        vBusy = true
+        offline?.pause()
+        beep()
+        vState = 1
+        vLocalOnly = false
+        say("Yes boss") { vResume() }
+    }
+
+    private fun vStart(cmd: String, localOnly: Boolean) {
+        vBusy = true
+        offline?.pause()
+        followRun?.let { main.removeCallbacks(it) }
+        handle(cmd, localOnly)
+    }
+
+    private fun vResume() {
+        vBusy = false
+        offline?.resume()
+        followRun?.let { main.removeCallbacks(it) }
+        val r = Runnable {
+            if (!vBusy) {
+                vState = 0
+                Commands.pending = null
+            }
+        }
+        followRun = r
+        main.postDelayed(r, 9000L)
+    }
+
+    // kaam ke baad agla hukum sunna
+    private fun nextCmd(localOnly: Boolean) {
+        if (useVosk) {
+            vLocalOnly = localOnly
+            vState = 1
+            vResume()
+        } else {
+            listen(true, localOnly)
+        }
+    }
+
+    // wapas wake word ka intezaar
+    private fun nextWake() {
+        if (useVosk) {
+            vState = 0
+            vResume()
+        } else {
+            again(100L)
+        }
+    }
+
+    // ---------------- Beech-beech me apne aap bolna ----------------
+    private fun scheduleChatter() {
+        chatterRun?.let { main.removeCallbacks(it) }
+        val r = Runnable {
+            chatterNow(false)
+            scheduleChatter()
+        }
+        chatterRun = r
+        main.postDelayed(r, Emotion.nextDelayMs())
+    }
+
+    private fun chatterNow(force: Boolean) {
+        if (!alive) return
+        if (!force) {
+            if (!getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("chatter", true)) return
+            if (Emotion.quietNow()) return
+            if (Commands.pending != null) return
+            val am = getSystemService(AudioManager::class.java)
+            if (am.isMusicActive || am.mode != AudioManager.MODE_NORMAL) return
+            if (tts?.isSpeaking == true) return
+            if (useVosk) {
+                if (vBusy || vState != 0) return
+            } else {
+                if (inCommand) return
+            }
+        }
+        val line = Emotion.idleLine()
+        if (useVosk) {
+            vBusy = true
+            offline?.pause()
+            say(line) { nextWake() }
+        } else {
+            gen++
+            try { rec?.cancel(); rec?.destroy() } catch (e: Exception) {}
+            rec = null
+            say(line) { again(100L) }
+        }
+    }
 
     // kaam ke baad: bina wake word bole agla hukum sun lo
     private fun afterLocal() {
-        if (Commands.pending != null) listen(true, false) else listen(true, true)
+        val ch = Emotion.chatNext
+        Emotion.chatNext = false
+        if (Commands.pending != null) nextCmd(false) else nextCmd(!ch)
     }
 
     // "fir/phir/uske baad/karke" wale kai kaam ek ke baad ek
     private fun runSteps(steps: List<String>, idx: Int) {
         if (!alive) return
         if (idx >= steps.size) {
-            listen(true, true)
+            nextCmd(true)
             return
         }
         val r = safeRun(steps[idx])
@@ -436,13 +653,14 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             return
         }
         if (Commands.pending != null) {
-            say(r) { listen(true, false) }
+            say(r) { nextCmd(false) }
             return
         }
         say(r) { main.postDelayed({ runSteps(steps, idx + 1) }, 1200L) }
     }
 
     private fun handle(low: String, localOnly: Boolean) {
+        Emotion.observe(low)
         if (Commands.pending == null) {
             val steps = Commands.split(low)
             if (steps.size > 1) {
@@ -456,20 +674,23 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             return
         }
         if (local != null) {
-            say(local) { afterLocal() }
+            say(Emotion.decorate(local)) { afterLocal() }
             return
         }
         if (localOnly) {
-            again(100L)
+            nextWake()
             return
         }
         val langName = Lang.name
+        val filler = Runnable { say("एक सेकंड बॉस", null) }
+        main.postDelayed(filler, 1800L)
         Thread {
-            val reply = try { Brain.ask(history, low, langName) } catch (e: Exception) { "इंटरनेट में दिक्कत लग रही है बॉस" }
+            val reply = try { Brain.ask(history, Emotion.tag() + low, langName) } catch (e: Exception) { "इंटरनेट में दिक्कत लग रही है बॉस" }
             main.post {
+                main.removeCallbacks(filler)
                 if (!alive) return@post
                 history.add(low to reply)
-                say(reply) { listen(true, false) }
+                say(reply) { nextCmd(false) }
             }
         }.start()
     }
@@ -477,6 +698,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         alive = false
         main.removeCallbacksAndMessages(null)
+        try { offline?.stop() } catch (e: Exception) {}
         try { rec?.destroy() } catch (e: Exception) {}
         try { tts?.shutdown() } catch (e: Exception) {}
         try {
@@ -484,137 +706,5 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         } catch (e: Exception) {}
         try { if (wl?.isHeld == true) wl?.release() } catch (e: Exception) {}
         super.onDestroy()
-    }
-}
-
-// =====================================================================
-//  ACCESSIBILITY SERVICE: scroll, back, home, click, type
-// =====================================================================
-class JarvisAccess : AccessibilityService() {
-    companion object {
-        @Volatile
-        var inst: JarvisAccess? = null
-    }
-
-    override fun onServiceConnected() { inst = this }
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
-    override fun onInterrupt() {}
-    override fun onUnbind(i: Intent?): Boolean { inst = null; return super.onUnbind(i) }
-    override fun onDestroy() { inst = null; super.onDestroy() }
-
-    private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float): Boolean {
-        val p = Path()
-        p.moveTo(x1, y1)
-        p.lineTo(x2, y2)
-        val g = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(p, 0L, 300L))
-            .build()
-          return dispatchGesture(g, null, null)
-    }
-
-    fun scroll(dir: String): String {
-        val d = resources.displayMetrics
-        val w = d.widthPixels.toFloat()
-        val h = d.heightPixels.toFloat()
-        val ok = when (dir) {
-            "up" -> swipe(w / 2, h * 0.30f, w / 2, h * 0.80f)
-            "left" -> swipe(w * 0.85f, h / 2, w * 0.15f, h / 2)
-            "right" -> swipe(w * 0.15f, h / 2, w * 0.85f, h / 2)
-            else -> swipe(w / 2, h * 0.80f, w / 2, h * 0.30f)
-        }
-        val name = when (dir) {
-            "up" -> "ऊपर"
-            "left" -> "बाएं"
-            "right" -> "दाएं"
-            else -> "नीचे"
-        }
-        return if (ok) "$name स्क्रॉल कर दिया" else "स्क्रॉल नहीं हो पाया"
-    }
-
-    fun global(action: Int, okMsg: String): String =
-        if (performGlobalAction(action)) okMsg else "ये नहीं हो पाया"
-
-    fun clickText(t: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val list = root.findAccessibilityNodeInfosByText(t)
-        for (n in list) {
-            var x: AccessibilityNodeInfo? = n
-            while (x != null) {
-                if (x.isClickable) return x.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                x = x.parent
-            }
-        }
-        return false
-    }
-
-    fun clickAny(labels: List<String>): Boolean {
-        for (l in labels) {
-            if (clickText(l)) return true
-        }
-        return false
-    }
-
-    fun typeText(t: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val n = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
-        val args = Bundle()
-        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, t)
-        return n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-    }
-}
-
-// =====================================================================
-//  AI DIMAAG (free, bina key): Pollinations
-// =====================================================================
-object Brain {
-    private const val URL_API = "https://text.pollinations.ai/openai"
-
-    private val liveWords = listOf(
-        "news", "khabar", "खबर", "samachar", "समाचार", "weather", "mausam", "मौसम", "score", "price", "rate",
-        "bhav", "भाव", "latest", "live", "stock", "who won", "cricket", "क्रिकेट", "match"
-    )
-
-    private fun persona(lang: String): String {
-        val l = if (lang == "Hindi") "देवनागरी हिंदी (ज़रूरी अंग्रेज़ी शब्द चल सकते हैं)" else lang
-        return "तुम 'वी' हो, मेरे सबसे करीबी, वफादार और भावुक दोस्त जैसे AI साथी। " +
-            "मुझे हमेशा 'बॉस' बुलाओ। मेरे मूड को पहचानो: उदास हूँ तो प्यार से हौसला दो, खुश हूँ तो साथ में खुश हो, " +
-            "थका हूँ तो ख्याल रखो। जवाब $l भाषा में दो। जवाब बोलकर सुनाया जाएगा, " +
-            "इसलिए सिर्फ 1-2 छोटे वाक्य, कोई इमोजी, स्टार, लिस्ट या मार्कडाउन नहीं। " +
-            "अगर मैं फोन चलाने का कोई काम बोलूँ जो तुम नहीं कर पाए, तो झूठ मत बोलो, सीधे बता दो।"
-    }
-
-    private fun msg(role: String, text: String) = JSONObject().put("role", role).put("content", text)
-
-    private fun post(model: String, msgs: JSONArray): String? {
-        val body = JSONObject().put("model", model).put("messages", msgs).put("max_tokens", 120)
-        val conn = URL(URL_API).openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.doOutput = true
-        conn.connectTimeout = 8000
-        conn.readTimeout = 25000
-        conn.outputStream.use { it.write(body.toString().toByteArray()) }
-        val code = conn.responseCode
-        if (code !in 200..299) return null
-        val raw = conn.inputStream.bufferedReader().use { it.readText() }
-        return try {
-            JSONObject(raw).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content").trim()
-        } catch (e: Exception) {
-            raw.trim()
-        }
-    }
-
-    fun ask(history: List<Pair<String, String>>, text: String, lang: String): String {
-        val msgs = JSONArray().put(msg("system", persona(lang)))
-        for ((u, a) in history.takeLast(6)) {
-            msgs.put(msg("user", u))
-            msgs.put(msg("assistant", a))
-        }
-        msgs.put(msg("user", text))
-        if (liveWords.any { text.contains(it) }) {
-            val r = try { post("searchgpt", msgs) } catch (e: Exception) { null }
-            if (r != null) return r
-        }
-        return post("openai", msgs) ?: "AI अभी व्यस्त है बॉस, थोड़ी देर बाद बोलिए"
     }
 }
