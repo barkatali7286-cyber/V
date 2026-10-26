@@ -10,7 +10,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,6 +20,18 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+
+      - name: Download offline Hindi speech model
+        run: |
+          mkdir -p app/src/main/assets
+          if curl -fL --retry 3 -o hi.zip https://alphacephei.com/vosk/models/vosk-model-small-hi-0.22.zip; then
+            unzip -q hi.zip || true
+            mv vosk-model-small-hi-0.22 app/src/main/assets/model-hi || true
+            rm -f hi.zip
+          else
+            echo "Model download failed, building without offline model"
+          fi
+          ls app/src/main/assets || true
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
