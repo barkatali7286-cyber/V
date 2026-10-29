@@ -20,14 +20,18 @@ interface OfflineCallback {
 }
 
 // =====================================================================
-//  OFFLINE VOICE ENGINE (Vosk): bina internet, lagatar sunta hai,
-//  mic baar-baar on/off nahi hota
+//  OFFLINE VOICE ENGINE (Vosk): bina internet, lagatar sunta hai.
+//  Mic kabhi band nahi hota (pause sirf software me hota hai),
+//  isliye mic baar-baar on/off nahi hota.
 // =====================================================================
 class Offline(private val ctx: Context, private val cb: OfflineCallback) {
     private val main = Handler(Looper.getMainLooper())
     private var model: Model? = null
     private var recognizer: Recognizer? = null
     private var svc: SpeechService? = null
+
+    @Volatile
+    private var paused = false
 
     private fun textOf(h: String?, key: String): String {
         if (h == null) return ""
@@ -40,11 +44,11 @@ class Offline(private val ctx: Context, private val cb: OfflineCallback) {
 
     private val listener = object : org.vosk.android.RecognitionListener {
         override fun onPartialResult(hypothesis: String?) {
-            cb.onPartial(textOf(hypothesis, "partial"))
+            if (!paused) cb.onPartial(textOf(hypothesis, "partial"))
         }
 
         override fun onResult(hypothesis: String?) {
-            cb.onFinal(textOf(hypothesis, "text"))
+            if (!paused) cb.onFinal(textOf(hypothesis, "text"))
         }
 
         override fun onFinalResult(hypothesis: String?) {}
@@ -81,12 +85,31 @@ class Offline(private val ctx: Context, private val cb: OfflineCallback) {
         }.start()
     }
 
+    // mic chalu rehta hai, bas Jarvis ke bolte waqt hum sunna ignore karte hain
     fun pause() {
-        try { svc?.setPause(true) } catch (e: Exception) {}
+        paused = true
     }
 
     fun resume() {
-        try { svc?.setPause(false) } catch (e: Exception) {}
+        resetState()
+        paused = false
+    }
+
+    // purani adhoori awaaz (Jarvis ki apni awaaz) saaf kar do
+    private fun resetState() {
+        try {
+            val s = svc
+            if (s != null) {
+                s.javaClass.getMethod("reset").invoke(s)
+                return
+            }
+        } catch (e: Throwable) {
+        }
+        try {
+            val r = recognizer
+            if (r != null) r.javaClass.getMethod("reset").invoke(r)
+        } catch (e: Throwable) {
+        }
     }
 
     fun stop() {
