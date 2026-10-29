@@ -32,6 +32,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -98,7 +99,7 @@ class JarvisAccess : AccessibilityService() {
         if (performGlobalAction(action)) okMsg else "ये नहीं हो पाया"
 
     fun clickText(t: String): Boolean {
-        val root = rootInActiveWindow ?: return false
+        val root = rootNode() ?: return false
         val list = root.findAccessibilityNodeInfosByText(t)
         for (n in list) {
             var x: AccessibilityNodeInfo? = n
@@ -115,6 +116,39 @@ class JarvisAccess : AccessibilityService() {
             if (clickText(l)) return true
         }
         return false
+    }
+
+    // active window na mile to app wali window dhoondh lo
+    private fun rootNode(): AccessibilityNodeInfo? {
+        val r = rootInActiveWindow
+        if (r != null) return r
+        try {
+            for (w in windows) {
+                if (w.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                    val rt = w.root
+                    if (rt != null) return rt
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return null
+    }
+
+    // screen pe jo likha dikh raha hai wo batata hai (jaanch ke liye)
+    fun readScreen(max: Int): String {
+        val root = rootNode() ?: return "मुझे स्क्रीन नहीं दिख रही, Accessibility बंद करके दोबारा चालू कीजिए"
+        val all = ArrayList<AccessibilityNodeInfo>()
+        collect(root, all, 0)
+        val seen = LinkedHashSet<String>()
+        for (n in all) {
+            if (!n.isVisibleToUser) continue
+            val l = label(n)
+            if (l.length < 3) continue
+            seen.add(l.take(30))
+            if (seen.size >= max) break
+        }
+        if (seen.isEmpty()) return "स्क्रीन पर मुझे कुछ पढ़ने लायक नहीं दिखा"
+        return "स्क्रीन पर ये दिख रहा है: " + seen.joinToString(", ")
     }
 
     private fun collect(n: AccessibilityNodeInfo?, out: ArrayList<AccessibilityNodeInfo>, depth: Int) {
@@ -140,7 +174,7 @@ class JarvisAccess : AccessibilityService() {
 
     // screen pe jo naam/title sabse milta hai use dabata hai (naam wapas deta hai)
     fun clickBest(q: String): String? {
-        val root = rootInActiveWindow ?: return null
+        val root = rootNode() ?: return null
         val all = ArrayList<AccessibilityNodeInfo>()
         collect(root, all, 0)
         val qw = q.split(" ").filter { it.isNotBlank() }
@@ -165,36 +199,101 @@ class JarvisAccess : AccessibilityService() {
             }
         }
         val b = best
-        if (b == null || bestScore < 6) return null
+        if (b == null || bestScore < 5) return null
         return if (clickUp(b)) label(b).take(40) else null
     }
 
-    // screen pe upar se nth (1,2,3..) video/item dabata hai
-    fun clickNth(nth: Int): String {
-        val root = rootInActiveWindow ?: return "स्क्रीन नहीं पढ़ पाया"
-        val all = ArrayList<AccessibilityNodeInfo>()
-        collect(root, all, 0)
+    private fun pickItems(all: ArrayList<AccessibilityNodeInfo>, minLabel: Int, minH: Int): List<AccessibilityNodeInfo> {
         val items = ArrayList<Pair<Int, AccessibilityNodeInfo>>()
         val r = Rect()
         for (n in all) {
             if (!n.isVisibleToUser || !n.isClickable) continue
-            if (label(n).length < 12) continue
+            if (label(n).length < minLabel) continue
             n.getBoundsInScreen(r)
-            if (r.height() < 120) continue
+            if (r.height() < minH) continue
             items.add(Pair(r.top, n))
         }
         items.sortBy { it.first }
-        val uniq = ArrayList<Pair<Int, AccessibilityNodeInfo>>()
+        val out = ArrayList<AccessibilityNodeInfo>()
+        var lastTop = -10000
         for (p in items) {
-            if (uniq.isEmpty() || p.first - uniq[uniq.size - 1].first > 80) uniq.add(p)
+            if (p.first - lastTop > 80) {
+                out.add(p.second)
+                lastTop = p.first
+            }
         }
-        if (nth < 1 || nth > uniq.size) return "स्क्रीन पर इतने वीडियो नहीं दिखे"
-        val n = uniq[nth - 1].second
-        return if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) "$nth वाला वीडियो चला दिया" else "ये नहीं चल पाया"
+        return out
+    }
+
+    // screen pe upar se nth (1,2,3..) video/item dabata hai
+    fun clickNth(nth: Int): String {
+        val root = rootNode() ?: return "स्क्रीन नहीं पढ़ पाया"
+        val all = ArrayList<AccessibilityNodeInfo>()
+        collect(root, all, 0)
+        var items = pickItems(all, 12, 120)
+        if (nth > items.size) items = pickItems(all, 5, 70)
+        if (nth < 1 || nth > items.size) return "स्क्रीन पर इतने वीडियो नहीं दिखे"
+        val n = items[nth - 1]
+        return if (clickUp(n)) "$nth वाला वीडियो चला दिया" else "ये नहीं चल पाया"
+    }
+
+    // screen pe "search" wala icon/box dhoondh kar dabata hai
+    fun clickSearchIcon(): Boolean {
+        val root = rootNode() ?: return false
+        val all = ArrayList<AccessibilityNodeInfo>()
+        collect(root, all, 0)
+        for (n in all) {
+            if (!n.isVisibleToUser) continue
+            val l = label(n).lowercase()
+            val id = (n.viewIdResourceName ?: "").lowercase()
+            if (l.contains("search") || l.contains("खोज") || l.contains("सर्च") || id.contains("search")) {
+                if (n.isEditable) {
+                    n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                    return true
+                }
+                if (clickUp(n)) return true
+            }
+        }
+        return false
+    }
+
+    // jo bhi likhne wala box khula hai usme text daalta hai
+    fun setInput(text: String): Boolean {
+        val root = rootNode() ?: return false
+        var target: AccessibilityNodeInfo? = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (target == null || !target.isEditable) {
+            val all = ArrayList<AccessibilityNodeInfo>()
+            collect(root, all, 0)
+            target = null
+            for (n in all) {
+                if (n.isEditable && n.isVisibleToUser) {
+                    target = n
+                    break
+                }
+            }
+        }
+        val tn = target ?: return false
+        tn.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle()
+        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        return tn.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    // keyboard ka search/enter dabata hai
+    fun pressSearch(): Boolean {
+        val root = rootNode() ?: return false
+        val t = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (t != null && Build.VERSION.SDK_INT >= 30) {
+            try {
+                if (t.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) return true
+            } catch (e: Exception) {
+            }
+        }
+        return clickAny(listOf("Search", "खोजें", "खोज", "सर्च", "Go"))
     }
 
     fun typeText(t: String): Boolean {
-        val root = rootInActiveWindow ?: return false
+        val root = rootNode() ?: return false
         val n = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
         val args = Bundle()
         args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, t)
