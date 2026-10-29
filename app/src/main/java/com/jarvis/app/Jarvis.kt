@@ -53,6 +53,8 @@ class MainActivity : Activity() {
             if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
         }.toTypedArray()
 
+    private var statusView: TextView? = null
+
     private fun addButton(col: LinearLayout, label: String, f: () -> Unit) {
         val btn = Button(this)
         btn.text = label
@@ -76,6 +78,12 @@ class MainActivity : Activity() {
         info.textSize = 16f
         col.addView(info)
 
+        val st = TextView(this)
+        st.text = "Status: " + (sp.getString("status", "abhi chalu nahi hua") ?: "")
+        st.textSize = 14f
+        statusView = st
+        col.addView(st)
+
         val wk = EditText(this)
         wk.hint = "Wake word (jaise: V, Jarvis, Computer)"
         wk.setText(sp.getString("wake", "V"))
@@ -98,6 +106,41 @@ class MainActivity : Activity() {
             sp.edit().putString("engine", nw).apply()
             val m = if (nw == "vosk") "Offline engine: tez aur bina internet" else "Google engine: zyada sahi, internet chahiye"
             Toast.makeText(this, m + ". Jarvis ko Stop karke dobara Start karo", Toast.LENGTH_LONG).show()
+        }
+        addButton(col, "Status dekho (kaun sa engine chal raha hai)") {
+            statusView?.text = "Status: " + (sp.getString("status", "abhi chalu nahi hua") ?: "")
+        }
+        addButton(col, "Notification access dena (Jarvis notification bataye)") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        addButton(col, "Notification bolna ON/OFF") {
+            val on = !sp.getBoolean("notif_speak", true)
+            sp.edit().putBoolean("notif_speak", on).apply()
+            Toast.makeText(this, if (on) "Jarvis notification bolega" else "Jarvis notification nahi bolega", Toast.LENGTH_SHORT).show()
+        }
+        addButton(col, "Notification detail ON/OFF (kisne kya bheja)") {
+            val on = !sp.getBoolean("notif_detail", true)
+            sp.edit().putBoolean("notif_detail", on).apply()
+            Toast.makeText(this, if (on) "Poori detail bolega" else "Sirf app ka naam bolega", Toast.LENGTH_SHORT).show()
+        }
+        addButton(col, "Awaaz style badlo: Jarvis / Normal / Soft") {
+            val cur = sp.getString("vstyle", "jarvis") ?: "jarvis"
+            val nw = if (cur == "jarvis") "normal" else if (cur == "normal") "soft" else "jarvis"
+            sp.edit().putString("vstyle", nw).apply()
+            Toast.makeText(this, "Awaaz style: $nw", Toast.LENGTH_SHORT).show()
+        }
+        addButton(col, "English UK male awaaz install karo (Jarvis jaisi)") {
+            try {
+                startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            }
+        }
+        addButton(col, "Bolne ka gap badlo (3 / 8 / 20 min)") {
+            val cur = sp.getInt("chat_min", 8)
+            val nw = if (cur == 3) 8 else if (cur == 8) 20 else 3
+            sp.edit().putInt("chat_min", nw).apply()
+            Toast.makeText(this, "Jarvis ab har ~$nw minute me bolega", Toast.LENGTH_SHORT).show()
         }
         addButton(col, "Beech-beech bolna ON/OFF") {
             val on = !sp.getBoolean("chatter", true)
@@ -133,6 +176,12 @@ class MainActivity : Activity() {
         val sv = ScrollView(this)
         sv.addView(col)
         setContentView(sv)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+        statusView?.text = "Status: " + (sp.getString("status", "abhi chalu nahi hua") ?: "")
     }
 
     private fun startJarvis() {
@@ -271,6 +320,13 @@ class JarvisService : Service(), TextToSpeech.OnInitListener, OfflineCallback {
             t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
                 override fun onDone(id: String?) {
+                    if (id != null && id.startsWith("s")) {
+                        main.post {
+                            streamQ--
+                            checkStreamEnd()
+                        }
+                        return
+                    }
                     if (id != curUtt) return
                     main.post { val f = afterSpeech; afterSpeech = null; f?.invoke() }
                 }
@@ -279,17 +335,25 @@ class JarvisService : Service(), TextToSpeech.OnInitListener, OfflineCallback {
             ttsReady = true
         }
         val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-        val g = if (h < 12) "सुप्रभात बॉस" else if (h < 17) "नमस्ते बॉस" else "शुभ संध्या बॉस"
+        val en = voiceStyle() == "jarvis"
+        val g = if (en) {
+            if (h < 12) "Good morning, boss. All systems online."
+            else if (h < 17) "Good afternoon, boss. All systems online."
+            else "Good evening, boss. All systems online."
+        } else {
+            if (h < 12) "सुप्रभात बॉस" else if (h < 17) "नमस्ते बॉस" else "शुभ संध्या बॉस"
+        }
         say(g) { startEngine() }
     }
 
-    // text me Devanagari ho to Hindi awaaz, warna Lang wali awaaz
+    // text me Devanagari ho to Hindi awaaz, warna English (Jarvis style me UK) ya Lang wali awaaz
     private fun applyVoice(text: String) {
-        val tag = if (text.any { it in '\u0900'..'\u097F' }) "hi-IN"
-        else if (Lang.code.startsWith("hi")) "en-IN"
+        val dev = text.any { it in '\u0900'..'\u097F' }
+        val tag = if (dev) "hi-IN"
+        else if (Lang.code.startsWith("hi")) (if (voiceStyle() == "jarvis") "en-GB" else "en-IN")
         else Lang.code
         if (tag != ttsTag) {
-            tts?.setLanguage(Locale.forLanguageTag(tag))
+            pickVoice(tag)
             ttsTag = tag
         }
     }
@@ -304,8 +368,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener, OfflineCallback {
         applyVoice(t)
         val id = "u" + System.nanoTime()
         curUtt = id
-        tts?.setPitch(Emotion.pitch())
-        tts?.setSpeechRate(Emotion.rate())
+        applyProsody()
         tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, id)
         val w = Runnable {
             if (curUtt == id) { val f = afterSpeech; afterSpeech = null; f?.invoke() }
@@ -375,7 +438,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener, OfflineCallback {
         gen++
         try { rec?.cancel(); rec?.destroy() } catch (e: Exception) {}
         rec = null
-        say("Yes boss") { listen(true, false) }
+        say(ack()) { listen(true, false) }
     }
 
     // command=false: sirf "Jarvis" ka intezaar. command=true: aapka hukum sunna.
@@ -456,35 +519,288 @@ class JarvisService : Service(), TextToSpeech.OnInitListener, OfflineCallback {
         rec?.startListening(i)
     }
 
+    // =================================================================
+    //  JARVIS 2.0: engine, bolna, notification, docs, search, streaming
+    // =================================================================
+    private var resumeToken = 0
+    private var lastReply = "बॉस, अभी मैंने कुछ बोला नहीं है"
+    private val notifQueue = ArrayList<String>()
+    private var drainScheduled = false
+    private var streamQ = 0
+    private var streamEnd = false
+    private var streamFirst = true
+    private var streamThen: (() -> Unit)? = null
+    private var streamWatch: Runnable? = null
+
+    private fun has(t: String, vararg w: String) = w.any { t.contains(it) }
+
     private fun safeRun(s: String): String? =
         try {
-            if (Commands.pending != null) Commands.run(this, s)
+            if (Commands.pending != null) Commands.run(this, Num.toDigitsText(s))
             else (Emotion.respond(s) ?: Extra.run(this, s) ?: Commands.run(this, s))
         } catch (e: Exception) {
             "ये काम नहीं हो पाया"
         }
 
+    private fun setStatus(s: String) {
+        getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("status", s).apply()
+    }
+
+    // ---------------- Awaaz: Jarvis jaisi gehri awaaz ----------------
+    private fun voiceStyle(): String =
+        getSharedPreferences("cfg", MODE_PRIVATE).getString("vstyle", "jarvis") ?: "jarvis"
+
+    private fun applyProsody() {
+        val st = voiceStyle()
+        val bp = if (st == "jarvis") 0.82f else if (st == "soft") 1.1f else 1.0f
+        val br = if (st == "jarvis") 0.95f else if (st == "soft") 1.0f else 1.1f
+        tts?.setPitch(bp * Emotion.pitch())
+        tts?.setSpeechRate(br * Emotion.rate() / 1.1f)
+    }
+
+    private fun pickVoice(tag: String) {
+        val t = tts ?: return
+        val want = Locale.forLanguageTag(tag)
+        t.setLanguage(want)
+        if (voiceStyle() != "jarvis") return
+        try {
+            val all = t.voices ?: return
+            val sameLang = all.filter { it.locale.language == want.language }
+            val exact = sameLang.filter { it.locale.country == want.country }
+            val pool = if (exact.isNotEmpty()) exact else sameLang
+            val male = pool.filter { v ->
+                val n = v.name.lowercase()
+                (n.contains("male") && !n.contains("female")) || n.contains("-gbb-") || n.contains("-gbd-") ||
+                    n.contains("-rjs-") || n.contains("-iom-")
+            }
+            val pick = male.firstOrNull()
+            if (pick != null) t.setVoice(pick)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun ack(): String {
+        val r = (Math.random() * 10).toInt()
+        return if (r < 6) "Yes boss" else if (r < 8) "At your service, boss" else "Right here, boss"
+    }
+
+    // ---------------- Lagataar bolna: pehla vaakya milte hi bolo ----------------
+    private fun streamSay(sentence: String) {
+        if (!ttsReady) return
+        applyVoice(sentence)
+        applyProsody()
+        val id = "s" + System.nanoTime()
+        val mode = if (streamFirst) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        streamFirst = false
+        streamQ++
+        tts?.speak(sentence, mode, null, id)
+    }
+
+    private fun checkStreamEnd() {
+        if (streamEnd && streamQ <= 0) {
+            streamWatch?.let { main.removeCallbacks(it) }
+            val f = streamThen
+            streamThen = null
+            f?.invoke()
+        }
+    }
+
+    private fun chatStream(low: String) {
+        val langName = Lang.name
+        val filler = Runnable { say("एक सेकंड बॉस", null) }
+        main.postDelayed(filler, 1500L)
+        streamQ = 0
+        streamEnd = false
+        streamFirst = true
+        streamThen = { nextCmd(false) }
+        Thread {
+            Fast.stream(history, Emotion.tag() + low, langName, object : Fast.Sink {
+                override fun onSentence(s: String) {
+                    main.post {
+                        main.removeCallbacks(filler)
+                        if (alive) streamSay(s)
+                    }
+                }
+
+                override fun onDone(full: String) {
+                    main.post {
+                        main.removeCallbacks(filler)
+                        if (!alive) return@post
+                        history.add(low to full)
+                        lastReply = full
+                        streamEnd = true
+                        streamWatch?.let { main.removeCallbacks(it) }
+                        val w = Runnable {
+                            streamQ = 0
+                            checkStreamEnd()
+                        }
+                        streamWatch = w
+                        main.postDelayed(w, 40000L)
+                        checkStreamEnd()
+                    }
+                }
+
+                override fun onFail() {
+                    main.post {
+                        main.removeCallbacks(filler)
+                        if (alive) chatBlocking(low)
+                    }
+                }
+            })
+        }.start()
+    }
+
+    // purana tareeka (poora jawab aane ke baad bolna): live khabar/mausam ke liye
+    private fun chatBlocking(low: String) {
+        val langName = Lang.name
+        val filler = Runnable { say("एक सेकंड बॉस", null) }
+        main.postDelayed(filler, 1200L)
+        Thread {
+            val reply = try { Brain.ask(history, Emotion.tag() + low, langName) } catch (e: Exception) { "इंटरनेट में दिक्कत लग रही है बॉस" }
+            main.post {
+                main.removeCallbacks(filler)
+                if (!alive) return@post
+                lastReply = reply
+                history.add(low to reply)
+                say(reply) { nextCmd(false) }
+            }
+        }.start()
+    }
+
+    // ---------------- Search: tez jawab (Wikipedia -> AI) ----------------
+    private fun searchAndSpeak(q: String, low: String, long: Boolean) {
+        val filler = Runnable { say("खोज रहा हूँ बॉस", null) }
+        main.postDelayed(filler, 1300L)
+        val langName = Lang.name
+        Thread {
+            var ans: String? = try { Search.answer(q, long) } catch (e: Exception) { null }
+            if (ans == null) {
+                ans = try { Brain.ask(history, Emotion.tag() + low, langName) } catch (e: Exception) { null }
+            }
+            val out = ans ?: "बॉस, अभी जवाब नहीं मिल पाया, इंटरनेट देखिए"
+            main.post {
+                main.removeCallbacks(filler)
+                if (!alive) return@post
+                lastReply = out
+                history.add(low to out)
+                say(out) { nextCmd(false) }
+            }
+        }.start()
+    }
+
+    // ---------------- PDF / Notes / Assignment ----------------
+    private fun beginDoc(kind: String, topic: String, useLast: Boolean) {
+        val source = if (useLast) lastReply else topic
+        val title = if (useLast) "Jarvis Notes" else topic
+        Thread {
+            val text = if (useLast) lastReply else Docs.generate(kind, source)
+            val uri = if (text != null) Docs.makePdf(this, title, text) else null
+            main.post {
+                if (!alive) return@post
+                whenIdle {
+                    if (uri != null) {
+                        try {
+                            val i = Intent(Intent.ACTION_VIEW)
+                            i.setDataAndType(uri, "application/pdf")
+                            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            startActivity(i)
+                        } catch (e: Exception) {
+                        }
+                        speakProactive("बॉस, आपका ${Docs.kindHindi(kind)} तैयार है. Downloads के Jarvis फोल्डर में रखा है", null)
+                    } else {
+                        speakProactive("बॉस, PDF नहीं बन पाया, इंटरनेट देखिए", null)
+                    }
+                }
+            }
+        }.start()
+    }
+
+    // ---------------- Jab Jarvis free ho tab kaam karo ----------------
+    private fun isIdle(): Boolean =
+        if (useVosk) !vBusy && vState == 0 else !inCommand && tts?.isSpeaking != true
+
+    private fun whenIdle(action: () -> Unit) {
+        if (!alive) return
+        if (isIdle()) action() else main.postDelayed({ whenIdle(action) }, 3000L)
+    }
+
+    private fun speakProactive(line: String, after: (() -> Unit)?) {
+        if (useVosk) {
+            vHold()
+            say(line) {
+                nextWake()
+                after?.invoke()
+            }
+        } else {
+            gen++
+            try { rec?.cancel(); rec?.destroy() } catch (e: Exception) {}
+            rec = null
+            say(line) {
+                again(100L)
+                after?.invoke()
+            }
+        }
+    }
+
+    // ---------------- Notification bolna ----------------
+    private fun onNotifLine(line: String) {
+        val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+        if (!sp.getBoolean("notif_speak", true)) return
+        if (Emotion.quietNow()) return
+        notifQueue.add(line)
+        while (notifQueue.size > 3) notifQueue.removeAt(0)
+        drainNotif()
+    }
+
+    private fun drainNotif() {
+        if (!alive || notifQueue.isEmpty() || drainScheduled) return
+        val am = getSystemService(AudioManager::class.java)
+        if (!isIdle() || am.mode != AudioManager.MODE_NORMAL) {
+            drainScheduled = true
+            main.postDelayed({
+                drainScheduled = false
+                drainNotif()
+            }, 5000L)
+            return
+        }
+        val line = notifQueue.removeAt(0)
+        speakProactive(line) { drainNotif() }
+    }
+
+    // ---------------- Reminder ----------------
+    private fun scheduleReminder(mins: Int, text: String) {
+        main.postDelayed({ remindNow(text) }, mins * 60_000L)
+    }
+
+    private fun remindNow(text: String) {
+        if (!alive) return
+        whenIdle { speakProactive("बॉस, याद दिला रहा हूँ, $text", null) }
+    }
+
     // ---------------- Engine: Offline (Vosk) ya Google ----------------
     private fun startEngine() {
         if (!alive) return
-        if (chatterRun == null) scheduleChatter()
+        if (chatterRun == null) scheduleChatter(true)
+        JarvisNotif.sink = { line -> main.post { onNotifLine(line) } }
         val eng = getSharedPreferences("cfg", MODE_PRIVATE).getString("engine", "vosk") ?: "vosk"
         if (eng == "vosk") {
             useVosk = true
+            setStatus("Offline engine load ho raha hai...")
             say("ऑफलाइन इंजन तैयार हो रहा है, थोड़ा रुकिए बॉस", null)
             val o = Offline(this, this)
             offline = o
             o.start()
         } else {
             useVosk = false
+            setStatus("Google engine chalu (isme mic baar-baar on/off hota hai)")
             again(100L)
         }
     }
 
     override fun onReady() {
         if (!alive) return
-        vBusy = true
-        offline?.pause()
+        setStatus("Offline engine chalu hai (mic lagatar on rehta hai)")
+        vHold()
         say("मैं तैयार हूँ बॉस") {
             vState = 0
             vResume()
@@ -496,13 +812,14 @@ class JarvisService : Service(), TextToSpeech.OnInitListener, OfflineCallback {
         Toast.makeText(this, "Offline engine error: $msg", Toast.LENGTH_LONG).show()
         if (useVosk) {
             useVosk = false
+            setStatus("Offline fail hua ($msg). Google engine chal raha hai")
             try { offline?.stop() } catch (e: Exception) {}
             offline = null
             say("ऑफलाइन इंजन नहीं चला, गूगल इंजन चालू कर रहा हूँ") { again(100L) }
         }
     }
 
-override fun onPartial(text: String) {
+    override fun onPartial(text: String) {
         if (!useVosk || vBusy || vState != 0 || text.isBlank()) return
         debug("सुना: $text")
         val after = afterWake(norm(text)) ?: return
@@ -538,26 +855,25 @@ override fun onPartial(text: String) {
         }
     }
 
-    private fun wakeNowV() {
-        cancelWake()
+    // mic chalu rehta hai; bas hum sunna rok dete hain
+    private fun vHold() {
+        resumeToken++
         vBusy = true
         offline?.pause()
-        beep()
-        vState = 1
-        vLocalOnly = false
-        say("Yes boss") { vResume() }
-    }
-
-    private fun vStart(cmd: String, localOnly: Boolean) {
-        vBusy = true
-        offline?.pause()
-        followRun?.let { main.removeCallbacks(it) }
-        handle(cmd, localOnly)
     }
 
     private fun vResume() {
-        vBusy = false
-        offline?.resume()
+        val tok = ++resumeToken
+        main.postDelayed({
+            if (alive && tok == resumeToken) {
+                offline?.resume()
+                vBusy = false
+                armFollow()
+            }
+        }, 350L)
+    }
+
+    private fun armFollow() {
         followRun?.let { main.removeCallbacks(it) }
         val r = Runnable {
             if (!vBusy) {
@@ -567,6 +883,21 @@ override fun onPartial(text: String) {
         }
         followRun = r
         main.postDelayed(r, 9000L)
+    }
+
+    private fun wakeNowV() {
+        cancelWake()
+        vHold()
+        beep()
+        vState = 1
+        vLocalOnly = false
+        say(ack()) { vResume() }
+    }
+
+    private fun vStart(cmd: String, localOnly: Boolean) {
+        vHold()
+        followRun?.let { main.removeCallbacks(it) }
+        handle(cmd, localOnly)
     }
 
     // kaam ke baad agla hukum sunna
@@ -591,14 +922,16 @@ override fun onPartial(text: String) {
     }
 
     // ---------------- Beech-beech me apne aap bolna ----------------
-    private fun scheduleChatter() {
+    private fun scheduleChatter(first: Boolean) {
         chatterRun?.let { main.removeCallbacks(it) }
         val r = Runnable {
             chatterNow(false)
-            scheduleChatter()
+            scheduleChatter(false)
         }
         chatterRun = r
-        main.postDelayed(r, Emotion.nextDelayMs())
+        val mins = getSharedPreferences("cfg", MODE_PRIVATE).getInt("chat_min", 8)
+        val delay = if (first) 90_000L else mins * 60_000L * (70 + (Math.random() * 61).toInt()) / 100
+        main.postDelayed(r, delay)
     }
 
     private fun chatterNow(force: Boolean) {
@@ -609,31 +942,16 @@ override fun onPartial(text: String) {
             if (Commands.pending != null) return
             val am = getSystemService(AudioManager::class.java)
             if (am.isMusicActive || am.mode != AudioManager.MODE_NORMAL) return
-            if (tts?.isSpeaking == true) return
-            if (useVosk) {
-                if (vBusy || vState != 0) return
-            } else {
-                if (inCommand) return
-            }
+            if (!isIdle()) return
         }
-        val line = Emotion.idleLine()
-        if (useVosk) {
-            vBusy = true
-            offline?.pause()
-            say(line) { nextWake() }
-        } else {
-            gen++
-            try { rec?.cancel(); rec?.destroy() } catch (e: Exception) {}
-            rec = null
-            say(line) { again(100L) }
-        }
+        speakProactive(Emotion.idleLine(), null)
     }
 
     // kaam ke baad: bina wake word bole agla hukum sun lo
     private fun afterLocal() {
         val ch = Emotion.chatNext
         Emotion.chatNext = false
-        if (Commands.pending != null) nextCmd(false) else nextCmd(!ch)
+     if (Commands.pending != null) nextCmd(false) else nextCmd(!ch)
     }
 
     // "fir/phir/uske baad/karke" wale kai kaam ek ke baad ek
@@ -662,42 +980,73 @@ override fun onPartial(text: String) {
     private fun handle(low: String, localOnly: Boolean) {
         Emotion.observe(low)
         if (Commands.pending == null) {
-            val steps = Commands.split(low)
+            if (has(low, "dobara bolo", "दोबारा बोलो", "phir se bolo", "फिर से बोलो", "repeat", "kya bola", "क्या बोला")) {
+                say(lastReply) { nextCmd(false) }
+                return
+            }
+
+            val dp = Docs.parse(low)
+            if (dp != null) {
+                val kind = dp.first
+                val topic = dp.second
+                val useLast = dp.third
+                if (topic.isBlank() && !useLast) {
+                    Commands.pending = { ans ->
+                        beginDoc(kind, ans.trim(), false)
+                        "ठीक है बॉस, बना रहा हूँ, थोड़ा समय लगेगा"
+                    }
+                    say("किस विषय पर बनाऊँ बॉस?") { nextCmd(false) }
+                    return
+                }
+                beginDoc(kind, topic, useLast)
+                say("ठीक है बॉस, ${Docs.kindHindi(kind)} बना रहा हूँ, थोड़ा समय लगेगा") { afterLocal() }
+                return
+            }
+
+            val rm = Extra.parseReminder(low)
+            if (rm != null) {
+                scheduleReminder(rm.first, rm.second)
+                say("ठीक है बॉस, ${rm.first} मिनट बाद याद दिलाऊँगा") { afterLocal() }
+                return
+            }
+
+            val steps = Extra.split(this, low)
             if (steps.size > 1) {
                 runSteps(steps, 0)
                 return
             }
+
+            val sq = Search.parse(low)
+            if (sq != null && (!localOnly || sq.second)) {
+                searchAndSpeak(sq.first, low, sq.second)
+                return
+            }
         }
+
         val local = safeRun(low)
         if (local == Commands.STOP) {
             say("ठीक है बॉस, मैं बंद हो रहा हूँ") { stopSelf() }
             return
         }
         if (local != null) {
-            say(Emotion.decorate(local)) { afterLocal() }
+            val shown = Emotion.decorate(local)
+            lastReply = shown
+            say(shown) { afterLocal() }
             return
         }
         if (localOnly) {
             nextWake()
             return
         }
-        val langName = Lang.name
-        val filler = Runnable { say("एक सेकंड बॉस", null) }
-        main.postDelayed(filler, 1800L)
-        Thread {
-            val reply = try { Brain.ask(history, Emotion.tag() + low, langName) } catch (e: Exception) { "इंटरनेट में दिक्कत लग रही है बॉस" }
-            main.post {
-                main.removeCallbacks(filler)
-                if (!alive) return@post
-                history.add(low to reply)
-                say(reply) { nextCmd(false) }
-            }
-        }.start()
+        val live = has(low, "mausam", "मौसम", "weather", "news", "khabar", "खबर", "samachar", "समाचार", "score",
+            "स्कोर", "price", "rate", "bhav", "भाव", "cricket", "क्रिकेट", "match", "मैच", "stock", "latest")
+        if (live) chatBlocking(low) else chatStream(low)
     }
 
     override fun onDestroy() {
         alive = false
         main.removeCallbacksAndMessages(null)
+        JarvisNotif.sink = null
         try { offline?.stop() } catch (e: Exception) {}
         try { rec?.destroy() } catch (e: Exception) {}
         try { tts?.shutdown() } catch (e: Exception) {}
